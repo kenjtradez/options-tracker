@@ -34,7 +34,7 @@ INSTRUMENTS = [
     {
         'id': 'XAUUSD', 'label': 'XAU/USD', 'full': 'XAU/USD \u00b7 Gold Spot',
         'symbol': 'XAU/USD', 'decimals': 2, 'multiplier': 1, 'optsSymbol': 'GLD',
-        'volProfile': 'Gold', 'atrMultiple': 1.5,
+        'volProfile': 'Gold', 'fixedRiskAbs': 15, 'fixedRiskLabel': 'Fixed 15 pips ($15)',
         'cot': {'report': 'legacy', 'datasetId': '6dca-aqww', 'marketLike': 'GOLD - COMMODITY EXCHANGE',
                 'longField': 'noncomm_positions_long_all', 'shortField': 'noncomm_positions_short_all',
                 'label': 'Non-Commercial (speculators)'},
@@ -42,7 +42,7 @@ INSTRUMENTS = [
     {
         'id': 'EURUSD', 'label': 'EUR/USD', 'full': 'EUR/USD \u00b7 Euro Spot',
         'symbol': 'EUR/USD', 'decimals': 5, 'multiplier': 1, 'optsSymbol': 'FXE',
-        'volProfile': 'EUR-USD', 'fixedRiskAbs': 0.00075, 'fixedRiskLabel': 'Fixed 7.5 pips',
+        'volProfile': 'EUR-USD', 'fixedRiskAbs': 0.0015, 'fixedRiskLabel': 'Fixed 15 pips',
         'cot': {'report': 'tff', 'datasetId': 'gpe5-46if', 'marketLike': 'EURO FX - CHICAGO MERCANTILE EXCHANGE',
                 'longField': 'lev_money_positions_long', 'shortField': 'lev_money_positions_short',
                 'label': 'Leveraged Money (speculators)'},
@@ -50,7 +50,7 @@ INSTRUMENTS = [
     {
         'id': 'NAS100', 'label': 'NAS100', 'full': 'NAS100 \u00b7 Nasdaq 100',
         'symbol': 'QQQ', 'decimals': 1, 'multiplier': 41, 'optsSymbol': 'QQQ',
-        'volProfile': 'NQ', 'fixedRiskPct': 0.45,
+        'volProfile': 'NQ', 'fixedRiskAbs': 130, 'fixedRiskLabel': 'Fixed 130 points',
         'cot': {'report': 'tff', 'datasetId': 'gpe5-46if',
                 'marketLike': 'NASDAQ-100 STOCK INDEX (MINI) - CHICAGO MERCANTILE EXCHANGE',
                 'longField': 'lev_money_positions_long', 'shortField': 'lev_money_positions_short',
@@ -79,6 +79,7 @@ MACRO_SERIES = [
 # ============ Twelve Data ============
 
 def td_get(params):
+    time.sleep(1.2)  # basic rate-limit courtesy; free-tier Twelve Data plans are easy to burst past otherwise
     params = dict(params)
     params['apikey'] = TWELVE_DATA_KEY
     r = requests.get('https://api.twelvedata.com/time_series', params=params, timeout=20)
@@ -98,7 +99,7 @@ def get_spot_and_intraday(inst):
 def get_daily_bars(inst, outputsize=120):
     data = td_get({'symbol': inst['symbol'], 'interval': '1day', 'outputsize': outputsize, 'timezone': 'UTC'})
     if 'values' not in data or not data['values']:
-        raise RuntimeError('No daily data for ' + inst['symbol'])
+        raise RuntimeError('No daily data for ' + inst['symbol'] + ': ' + json.dumps(data)[:200])
     mult = inst['multiplier']
     bars = []
     for v in reversed(data['values']):
@@ -107,6 +108,8 @@ def get_daily_bars(inst, outputsize=120):
             'open': float(v['open']) * mult, 'high': float(v['high']) * mult,
             'low': float(v['low']) * mult, 'close': float(v['close']) * mult,
         })
+    if len(bars) < 20:
+        raise RuntimeError('Only {} daily bars returned for {} (need 20+) \u2014 likely rate-limited or plan-restricted, not a real data gap'.format(len(bars), inst['symbol']))
     return bars
 
 
@@ -166,7 +169,17 @@ def get_options_levels(inst, spot):
         raise RuntimeError('No expirations for ' + symbol)
     now_sec = int(time.time())
     future = sorted([d for d in exp_dates if d >= now_sec])
-    nearest_exp = future[0] if future else sorted(exp_dates)[-1]
+    min_dte_sec, max_dte_sec = 3 * 86400, 45 * 86400  # front-month-ish window, same as dashboard
+    front_month = [d for d in future if min_dte_sec <= (d - now_sec) <= max_dte_sec]
+    with_runway = [d for d in future if (d - now_sec) >= min_dte_sec]
+    if front_month:
+        nearest_exp = front_month[0]
+    elif with_runway:
+        nearest_exp = with_runway[0]
+    elif future:
+        nearest_exp = future[-1]
+    else:
+        nearest_exp = sorted(exp_dates)[-1]
 
     opts_block = None
     if result.get('options') and result['options'][0].get('expirationDate') == nearest_exp:
@@ -199,8 +212,9 @@ def get_options_levels(inst, spot):
 
     calls = [c for c in chain if c['type'] == 'call' and c['oi'] > 0]
     puts = [c for c in chain if c['type'] == 'put' and c['oi'] > 0]
-    call_wall = max(calls, key=lambda c: c['oi']) if calls else None
-    put_wall = max(puts, key=lambda c: c['oi']) if puts else None
+    gex_weight = lambda c: (c['gamma'] * c['oi']) if c.get('gamma') is not None else 0
+    call_wall = max(calls, key=gex_weight) if calls else None
+    put_wall = max(puts, key=gex_weight) if puts else None
     total_call_oi = sum(c['oi'] for c in calls)
     total_put_oi = sum(c['oi'] for c in puts)
     pc_ratio = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
@@ -449,8 +463,9 @@ def process_instrument(inst):
 
         buffer_, buffer_source = compute_stop_buffer(inst, spot, daily_bars)
         out['bufferSource'] = buffer_source
+        stop_is_reliable = 'fallback' not in buffer_source
 
-        if opts.get('callWall') is not None and opts.get('putWall') is not None and opts.get('maxPain') is not None:
+        if stop_is_reliable and opts.get('callWall') is not None and opts.get('putWall') is not None and opts.get('maxPain') is not None:
             dist_call = abs(opts['callWall'] - spot)
             dist_put = abs(spot - opts['putWall'])
             if dist_call <= dist_put:
@@ -500,6 +515,8 @@ def format_message(results):
                 fmt(idea['tp1'], inst['decimals']),
                 'put wall' if idea['direction'] == 'SELL' else 'call wall',
                 fmt(idea['tp2'], inst['decimals'])))
+        elif r.get('bufferSource') and 'fallback' in r['bufferSource']:
+            lines.append('  \u26a0 Trade idea skipped: stop sizing unreliable ({})'.format(r['bufferSource']))
         vf = r.get('volForecast')
         if vf:
             lines.append('Vol range: Med [{}, {}] \u00b7 75p [{}, {}]'.format(
